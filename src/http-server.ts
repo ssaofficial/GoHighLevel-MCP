@@ -139,23 +139,15 @@ class GHLMCPHttpServer {
 
 
     // Security: Only allow requests with the correct MCP secret key
-
-    this.app.use('/sse', (req, res, next) => {
-
+    this.app.use('/sse', (req: express.Request, res: express.Response, next: express.NextFunction) => {
       const auth = req.headers.authorization;
-
       if (auth !== `Bearer ${process.env.MCP_SECRET_KEY}`) {
-
         console.warn('[SECURITY] Unauthorized access attempt to /sse');
-
-        return res.status(401).send('Unauthorized');
-
+        res.status(401).send('Unauthorized');
+        return;
       }
-
       next();
-
     });
-
   }
 
   /**
