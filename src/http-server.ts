@@ -1,12 +1,15 @@
 /**
  * GoHighLevel MCP HTTP Server
- * HTTP version for ChatGPT web integration
+ * Supports both Streamable HTTP (/mcp) and legacy SSE (/sse) transports
+ * Streamable HTTP is the current MCP spec (2025-03-26+); SSE is deprecated
  */
 
 import express from 'express';
 import cors from 'cors';
+import { randomUUID } from 'crypto';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { 
   CallToolRequestSchema,
   ErrorCode,
@@ -115,30 +118,36 @@ class GHLMCPHttpServer {
    * Setup Express middleware and configuration
    */
   private setupExpress(): void {
-    // Enable CORS for ChatGPT integration
+    // Enable CORS for all origins (required for n8n and other MCP clients)
     this.app.use(cors({
-      origin: ['https://chatgpt.com', 'https://chat.openai.com', 'http://localhost:*'],
-      methods: ['GET', 'POST', 'OPTIONS'],
-      allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
-      credentials: true
+      origin: '*',
+      methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+      allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'Mcp-Session-Id'],
+      exposedHeaders: ['Mcp-Session-Id'],
+      credentials: false
     }));
 
     // Parse JSON requests
     this.app.use(express.json());
 
     // Request logging
-
-    this.app.use((req, res, next) => {
-
+    this.app.use((req: express.Request, res: express.Response, next: express.NextFunction) => {
       console.log(`[HTTP] ${req.method} ${req.path} - ${new Date().toISOString()}`);
-
       next();
-
     });
 
+    // Security middleware: protect /mcp endpoint with Bearer token
+    this.app.use('/mcp', (req: express.Request, res: express.Response, next: express.NextFunction) => {
+      const auth = req.headers.authorization;
+      if (auth !== `Bearer ${process.env.MCP_SECRET_KEY}`) {
+        console.warn('[SECURITY] Unauthorized access attempt to /mcp');
+        res.status(401).json({ error: 'Unauthorized' });
+        return;
+      }
+      next();
+    });
 
-
-    // Security: Only allow requests with the correct MCP secret key
+    // Security middleware: protect /sse endpoint with Bearer token (legacy)
     this.app.use('/sse', (req: express.Request, res: express.Response, next: express.NextFunction) => {
       const auth = req.headers.authorization;
       if (auth !== `Bearer ${process.env.MCP_SECRET_KEY}`) {
@@ -367,7 +376,70 @@ class GHLMCPHttpServer {
       }
     });
 
-    // SSE endpoint for ChatGPT MCP connection
+    // =========================================================
+    // STREAMABLE HTTP ENDPOINT - Primary MCP transport (current spec)
+    // n8n HTTP Streamable mode connects to POST /mcp
+    // =========================================================
+    this.app.all('/mcp', async (req: express.Request, res: express.Response) => {
+      console.log(`[GHL MCP HTTP] Streamable HTTP request: ${req.method} /mcp`);
+      
+      try {
+        // Create a new stateless transport for each request
+        // Stateless mode is correct for serverless/cloud deployments
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: undefined, // stateless mode
+        });
+
+        // Connect a fresh MCP server instance to this transport
+        // We create a new server per request to avoid state sharing issues
+        const mcpServer = new Server(
+          { name: 'ghl-mcp-server', version: '1.0.0' },
+          { capabilities: { tools: {} } }
+        );
+
+        // Register tool handlers on the per-request server
+        mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
+          const allTools = this.getAllTools();
+          console.log(`[GHL MCP HTTP] /mcp listing ${allTools.length} tools`);
+          return { tools: allTools };
+        });
+
+        mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
+          const { name, arguments: args } = request.params;
+          console.log(`[GHL MCP HTTP] /mcp executing tool: ${name}`);
+          
+          try {
+            const result = await this.executeTool(name, args || {});
+            return {
+              content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
+            };
+          } catch (error) {
+            throw new McpError(ErrorCode.InternalError, `Tool execution failed: ${error}`);
+          }
+        });
+
+        // Connect server to transport
+        await mcpServer.connect(transport);
+
+        // Handle the request
+        await transport.handleRequest(req as any, res as any, req.body);
+
+        // Clean up
+        res.on('finish', () => {
+          transport.close().catch(() => {});
+        });
+
+      } catch (error) {
+        console.error('[GHL MCP HTTP] Streamable HTTP error:', error);
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Internal server error' });
+        }
+      }
+    });
+
+    // =========================================================
+    // LEGACY SSE ENDPOINT - Deprecated but kept for compatibility
+    // =========================================================
     const handleSSE = async (req: express.Request, res: express.Response) => {
       const sessionId = req.query.sessionId || 'unknown';
       console.log(`[GHL MCP HTTP] New SSE connection from: ${req.ip}, sessionId: ${sessionId}, method: ${req.method}`);
@@ -393,13 +465,12 @@ class GHLMCPHttpServer {
         if (!res.headersSent) {
           res.status(500).json({ error: 'Failed to establish SSE connection' });
         } else {
-          // If headers were already sent, close the connection
           res.end();
         }
       }
     };
 
-    // Handle both GET and POST for SSE (MCP protocol requirements)
+    // Handle both GET and POST for SSE (legacy MCP protocol requirements)
     this.app.get('/sse', handleSSE);
     this.app.post('/sse', handleSSE);
 
@@ -413,12 +484,81 @@ class GHLMCPHttpServer {
           health: '/health',
           capabilities: '/capabilities',
           tools: '/tools',
-          sse: '/sse'
+          mcp: '/mcp (Streamable HTTP - current spec)',
+          sse: '/sse (deprecated - legacy only)'
         },
         tools: this.getToolsCount(),
-        documentation: 'https://github.com/your-repo/ghl-mcp-server'
+        documentation: 'https://github.com/ssaofficial/GoHighLevel-MCP'
       });
     });
+  }
+
+  /**
+   * Get all tool definitions as a flat array
+   */
+  private getAllTools(): any[] {
+    return [
+      ...this.contactTools.getToolDefinitions(),
+      ...this.conversationTools.getToolDefinitions(),
+      ...this.blogTools.getToolDefinitions(),
+      ...this.opportunityTools.getToolDefinitions(),
+      ...this.calendarTools.getToolDefinitions(),
+      ...this.emailTools.getToolDefinitions(),
+      ...this.locationTools.getToolDefinitions(),
+      ...this.emailISVTools.getToolDefinitions(),
+      ...this.socialMediaTools.getTools(),
+      ...this.mediaTools.getToolDefinitions(),
+      ...this.objectTools.getToolDefinitions(),
+      ...this.associationTools.getTools(),
+      ...this.customFieldV2Tools.getTools(),
+      ...this.workflowTools.getTools(),
+      ...this.surveyTools.getTools(),
+      ...this.storeTools.getTools(),
+      ...this.productsTools.getTools()
+    ];
+  }
+
+  /**
+   * Execute a tool by name
+   */
+  private async executeTool(name: string, args: Record<string, any>): Promise<any> {
+    if (this.isContactTool(name)) {
+      return await this.contactTools.executeTool(name, args);
+    } else if (this.isConversationTool(name)) {
+      return await this.conversationTools.executeTool(name, args);
+    } else if (this.isBlogTool(name)) {
+      return await this.blogTools.executeTool(name, args);
+    } else if (this.isOpportunityTool(name)) {
+      return await this.opportunityTools.executeTool(name, args);
+    } else if (this.isCalendarTool(name)) {
+      return await this.calendarTools.executeTool(name, args);
+    } else if (this.isEmailTool(name)) {
+      return await this.emailTools.executeTool(name, args);
+    } else if (this.isLocationTool(name)) {
+      return await this.locationTools.executeTool(name, args);
+    } else if (this.isEmailISVTool(name)) {
+      return await this.emailISVTools.executeTool(name, args);
+    } else if (this.isSocialMediaTool(name)) {
+      return await this.socialMediaTools.executeTool(name, args);
+    } else if (this.isMediaTool(name)) {
+      return await this.mediaTools.executeTool(name, args);
+    } else if (this.isObjectTool(name)) {
+      return await this.objectTools.executeTool(name, args);
+    } else if (this.isAssociationTool(name)) {
+      return await this.associationTools.executeAssociationTool(name, args);
+    } else if (this.isCustomFieldV2Tool(name)) {
+      return await this.customFieldV2Tools.executeCustomFieldV2Tool(name, args);
+    } else if (this.isWorkflowTool(name)) {
+      return await this.workflowTools.executeWorkflowTool(name, args);
+    } else if (this.isSurveyTool(name)) {
+      return await this.surveyTools.executeSurveyTool(name, args);
+    } else if (this.isStoreTool(name)) {
+      return await this.storeTools.executeStoreTool(name, args);
+    } else if (this.isProductsTool(name)) {
+      return await this.productsTools.executeProductsTool(name, args);
+    } else {
+      throw new Error(`Unknown tool: ${name}`);
+    }
   }
 
   /**
@@ -711,9 +851,10 @@ class GHLMCPHttpServer {
       this.app.listen(this.port, '0.0.0.0', () => {
         console.log('✅ GoHighLevel MCP HTTP Server started successfully!');
         console.log(`🌐 Server running on: http://0.0.0.0:${this.port}`);
-        console.log(`🔗 SSE Endpoint: http://0.0.0.0:${this.port}/sse`);
+        console.log(`🔗 Streamable HTTP Endpoint: http://0.0.0.0:${this.port}/mcp`);
+        console.log(`🔗 Legacy SSE Endpoint: http://0.0.0.0:${this.port}/sse`);
         console.log(`📋 Tools Available: ${this.getToolsCount().total}`);
-        console.log('🎯 Ready for ChatGPT integration!');
+        console.log('🎯 Ready for n8n and MCP client integration!');
         console.log('=========================================');
       });
       
@@ -759,4 +900,4 @@ async function main(): Promise<void> {
 main().catch((error) => {
   console.error('Unhandled error:', error);
   process.exit(1);
-}); 
+});
