@@ -386,8 +386,11 @@ class GHLMCPHttpServer {
       try {
         // Create a new stateless transport for each request
         // Stateless mode is correct for serverless/cloud deployments
+        // enableJsonResponse: true makes the server return Content-Type: application/json
+        // instead of text/event-stream, which is required for n8n compatibility
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: undefined, // stateless mode
+          enableJsonResponse: true, // return JSON instead of SSE stream (required for n8n)
         });
 
         // Connect a fresh MCP server instance to this transport
