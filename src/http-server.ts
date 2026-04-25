@@ -127,10 +127,35 @@ class GHLMCPHttpServer {
     this.app.use(express.json());
 
     // Request logging
+
     this.app.use((req, res, next) => {
+
       console.log(`[HTTP] ${req.method} ${req.path} - ${new Date().toISOString()}`);
+
       next();
+
     });
+
+
+
+    // Security: Only allow requests with the correct MCP secret key
+
+    this.app.use('/sse', (req, res, next) => {
+
+      const auth = req.headers.authorization;
+
+      if (auth !== `Bearer ${process.env.MCP_SECRET_KEY}`) {
+
+        console.warn('[SECURITY] Unauthorized access attempt to /sse');
+
+        return res.status(401).send('Unauthorized');
+
+      }
+
+      next();
+
+    });
+
   }
 
   /**
