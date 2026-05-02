@@ -4,6 +4,7 @@
  */
 
 import axios, { AxiosInstance, AxiosResponse, AxiosError } from 'axios';
+import { AsyncLocalStorage } from 'async_hooks';
 import {
   GHLConfig,
   GHLContact,
@@ -387,18 +388,61 @@ import {
  * GoHighLevel API Client
  * Handles all API communication with GHL services
  */
+/**
+ * Per-request credential override.
+ *
+ * Multi-tenant callers (e.g. the /mcp endpoint receiving x-ghl-token /
+ * x-ghl-location-id headers) wrap the handler in `runWithGhlOverride()` so
+ * that the API client picks up *those* credentials for the duration of that
+ * request. When the store is empty (env-driven SSA dashboard path), the
+ * client falls through to the constructor-supplied GHLConfig.
+ */
+export interface GhlRequestOverride {
+  accessToken?: string;
+  locationId?: string;
+}
+
+const requestContext = new AsyncLocalStorage<GhlRequestOverride>();
+
+export function runWithGhlOverride<T>(
+  override: GhlRequestOverride,
+  fn: () => Promise<T> | T
+): Promise<T> | T {
+  return requestContext.run(override, fn);
+}
+
 export class GHLApiClient {
   private axiosInstance: AxiosInstance;
-  private config: GHLConfig;
+  private baseConfig: GHLConfig;
+
+  /**
+   * Effective config for the current request.
+   *
+   * Tool implementations read `this.config.locationId` / `this.config.accessToken`
+   * directly. The getter transparently substitutes ALS-stored per-request
+   * overrides — so multi-tenant requests see their own creds without any
+   * tool-side change. With no active override, this is identical to the
+   * env-driven config passed to the constructor.
+   */
+  get config(): GHLConfig {
+    const override = requestContext.getStore();
+    if (!override) return this.baseConfig;
+    return {
+      ...this.baseConfig,
+      accessToken: override.accessToken ?? this.baseConfig.accessToken,
+      locationId: override.locationId ?? this.baseConfig.locationId,
+    };
+  }
 
   constructor(config: GHLConfig) {
-    this.config = config;
-    
-    // Create axios instance with base configuration
+    this.baseConfig = config;
+
+    // Create axios instance. Note: Authorization is intentionally NOT set in
+    // these static headers — it's injected per-request by the interceptor
+    // below so that ALS-stored overrides take precedence over baseConfig.
     this.axiosInstance = axios.create({
       baseURL: config.baseUrl,
       headers: {
-        'Authorization': `Bearer ${config.accessToken}`,
         'Version': config.version,
         'Content-Type': 'application/json',
         'Accept': 'application/json'
@@ -406,9 +450,13 @@ export class GHLApiClient {
       timeout: 30000 // 30 second timeout
     });
 
-    // Add request interceptor for logging
+    // Inject Authorization header at request time, reading from ALS-overridden
+    // config when present. Also logs.
     this.axiosInstance.interceptors.request.use(
       (config) => {
+        const token = this.config.accessToken;
+        config.headers = config.headers ?? {} as any;
+        (config.headers as any)['Authorization'] = `Bearer ${token}`;
         process.stderr.write(`[GHL API] ${config.method?.toUpperCase()} ${config.url}\n`);
         return config;
       },

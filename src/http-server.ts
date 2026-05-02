@@ -18,7 +18,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import * as dotenv from 'dotenv';
 
-import { GHLApiClient } from './clients/ghl-api-client';
+import { GHLApiClient, runWithGhlOverride, GhlRequestOverride } from './clients/ghl-api-client';
 import { ContactTools } from './tools/contact-tools';
 import { ConversationTools } from './tools/conversation-tools';
 import { BlogTools } from './tools/blog-tools';
@@ -40,6 +40,17 @@ import { GHLConfig } from './types/ghl-types';
 
 // Load environment variables
 dotenv.config();
+
+/**
+ * Pull a single string from an Express header value (which may be string,
+ * string[], or undefined). Returns null when missing or empty after trim.
+ */
+function pickHeader(v: string | string[] | undefined): string | null {
+  const raw = Array.isArray(v) ? v[0] : v;
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
 
 /**
  * HTTP MCP Server class for web deployment
@@ -382,8 +393,18 @@ class GHLMCPHttpServer {
     // =========================================================
     this.app.all('/mcp', async (req: express.Request, res: express.Response) => {
       console.log(`[GHL MCP HTTP] Streamable HTTP request: ${req.method} /mcp`);
-      
-      try {
+
+      // Multi-tenant per-request creds. If both headers are absent, override
+      // is empty and the client falls through to env-driven baseConfig (SSA
+      // dashboard's existing path is unchanged). If either header is present,
+      // it wins for the duration of this request only.
+      const headerToken = pickHeader(req.headers['x-ghl-token']);
+      const headerLocationId = pickHeader(req.headers['x-ghl-location-id']);
+      const override: GhlRequestOverride = {};
+      if (headerToken) override.accessToken = headerToken;
+      if (headerLocationId) override.locationId = headerLocationId;
+
+      const handle = async () => {
         // Create a new stateless transport for each request
         // Stateless mode is correct for serverless/cloud deployments
         // enableJsonResponse: true makes the server return Content-Type: application/json
@@ -410,7 +431,7 @@ class GHLMCPHttpServer {
         mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
           const { name, arguments: args } = request.params;
           console.log(`[GHL MCP HTTP] /mcp executing tool: ${name}`);
-          
+
           try {
             const result = await this.executeTool(name, args || {});
             return {
@@ -431,7 +452,10 @@ class GHLMCPHttpServer {
         res.on('finish', () => {
           transport.close().catch(() => {});
         });
+      };
 
+      try {
+        await runWithGhlOverride(override, handle);
       } catch (error) {
         console.error('[GHL MCP HTTP] Streamable HTTP error:', error);
         if (!res.headersSent) {
